@@ -1,3 +1,8 @@
+# Development-only overrides. Compose merges this automatically on top of
+# docker-compose.yml whenever you run `docker compose up` without -f.
+# This is what switches the container to `nest start --watch` with hot
+# reload — do NOT use this for a real deployment. For a production run, see
+# the -f command noted at the top of docker-compose.yml.
 services:
   main-server:
     build:

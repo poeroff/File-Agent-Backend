@@ -1,3 +1,10 @@
+# Production base config — builds the `runner` stage (nest build + node dist/main).
+# Run this alone with: docker compose -f docker-compose.yml up -d --build
+#
+# For local development, don't run this file by itself — just use
+# `docker compose up -d --build` (no -f flag), which auto-merges
+# docker-compose.override.yml on top and switches to the dev stage
+# with hot reload instead.
 services:
   main-server:
     build:
