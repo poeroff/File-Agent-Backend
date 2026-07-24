@@ -1,0 +1,14 @@
+services:
+  main-server:
+    build:
+      target: dev
+    environment:
+      - NODE_ENV=development
+      - CHOKIDAR_USEPOLLING=true
+      # tsc's default watcher misses fs events through Docker Desktop's
+      # Windows bind mount, so force it to poll instead.
+      - TSC_WATCHFILE=PriorityPollingInterval
+      - TSC_WATCHDIRECTORY=DynamicPriorityPolling
+    volumes:
+      - ./server/main_server:/app
+      - /app/node_modules

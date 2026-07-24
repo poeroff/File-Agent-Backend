@@ -6,6 +6,10 @@ FROM base AS deps
 COPY package.json pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
 
+FROM deps AS dev
+EXPOSE 4000
+CMD ["pnpm", "run", "start:dev"]
+
 FROM base AS build
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
