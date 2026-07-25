@@ -1,8 +1,13 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { User } from '../users/user.entity';
+import { StorageService } from '../storage/storage.service';
 import { GoogleSignInDto } from './dto/google-signin.dto';
 
 @Injectable()
@@ -10,6 +15,7 @@ export class AuthService {
   constructor(
     @InjectRepository(User) private readonly users: Repository<User>,
     private readonly jwt: JwtService,
+    private readonly storage: StorageService,
   ) {}
 
   async signInWithGoogle(dto: GoogleSignInDto) {
@@ -17,23 +23,42 @@ export class AuthService {
       throw new BadRequestException('providerAccountId and email are required');
     }
 
-    let user = await this.users.findOne({
+    const existing = await this.users.findOne({
       where: { providerAccountId: dto.providerAccountId },
     });
 
-    if (!user) {
-      user = this.users.create({
-        providerAccountId: dto.providerAccountId,
-        email: dto.email,
-        name: dto.name ?? null,
-        image: dto.image ?? null,
-      });
+    let user: User;
+    if (!existing) {
+      user = await this.users.save(
+        this.users.create({
+          providerAccountId: dto.providerAccountId,
+          email: dto.email,
+          name: dto.name ?? null,
+          image: dto.image ?? null,
+        }),
+      );
+
+      // Brand-new user: provision their personal S3 folder. If that fails,
+      // roll back the row so the next login retries cleanly instead of
+      // leaving a user with no storage (existing users skip this entirely,
+      // keeping steady-state logins fast).
+      try {
+        await this.storage.ensureUserFolder(user.id);
+      } catch {
+        // Storage provisioning failed (StorageService already logged why) —
+        // undo the just-created account so it isn't half-created, and return
+        // a clean 503 the frontend can surface as a network error.
+        await this.users.remove(user);
+        throw new ServiceUnavailableException(
+          'Failed to provision user storage',
+        );
+      }
     } else {
-      user.email = dto.email;
-      user.name = dto.name ?? user.name;
-      user.image = dto.image ?? user.image;
+      existing.email = dto.email;
+      existing.name = dto.name ?? existing.name;
+      existing.image = dto.image ?? existing.image;
+      user = await this.users.save(existing);
     }
-    user = await this.users.save(user);
 
     const accessToken = await this.jwt.signAsync({
       sub: user.id,

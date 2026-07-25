@@ -1,12 +1,10 @@
 import { Controller, Get } from '@nestjs/common';
-import { AppService } from './app.service';
 
 @Controller()
 export class AppController {
-  constructor(private readonly appService: AppService) {}
-
+  // Health endpoint — docker-compose's healthcheck hits GET /.
   @Get()
-  getHello(): string {
-    return this.appService.getHello();
+  getHealth(): string {
+    return 'ok';
   }
 }
