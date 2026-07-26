@@ -5,7 +5,6 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { AppController } from './app.controller';
 import { AuthModule } from './auth/auth.module';
 import { FilesModule } from './files/files.module';
-import { TrashCleanupModule } from './trash/trash-cleanup.module';
 
 @Module({
   imports: [
@@ -13,7 +12,6 @@ import { TrashCleanupModule } from './trash/trash-cleanup.module';
     ScheduleModule.forRoot(),
     AuthModule,
     FilesModule,
-    TrashCleanupModule,
     TypeOrmModule.forRootAsync({
       imports: [ConfigModule],
       inject: [ConfigService],

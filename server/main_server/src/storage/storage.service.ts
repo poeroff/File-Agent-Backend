@@ -1,14 +1,13 @@
-import { randomUUID } from 'crypto';
 import { Injectable, Logger, type OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
   AbortMultipartUploadCommand,
   CompleteMultipartUploadCommand,
-  CopyObjectCommand,
   CreateMultipartUploadCommand,
   DeleteObjectsCommand,
   GetBucketLifecycleConfigurationCommand,
   GetObjectCommand,
+  HeadObjectCommand,
   ListObjectsV2Command,
   PutBucketCorsCommand,
   PutBucketLifecycleConfigurationCommand,
@@ -23,28 +22,6 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 export interface MultipartPart {
   partNumber: number;
   etag: string;
-}
-
-// Reserved folder that holds trashed items; hidden from the normal listing.
-const TRASH_PREFIX = '.trash/';
-
-export interface StorageObject {
-  /** Key relative to the user's folder, e.g. "Photos/pic.jpg" or "Photos/". */
-  key: string;
-  size: number;
-  /** Last-modified time in epoch milliseconds. */
-  lastModified: number;
-}
-
-export interface TrashEntry {
-  /** Opaque id used to restore/delete this entry. */
-  entryId: string;
-  /** Original path this was trashed from (folders end with "/"). */
-  originalPath: string;
-  name: string;
-  type: 'file' | 'folder';
-  size: number;
-  lastModified: number;
 }
 
 @Injectable()
@@ -66,6 +43,12 @@ export class StorageService implements OnModuleInit {
    * be resumed, short enough that abandoned parts don't sit there billing.
    */
   static readonly ABANDONED_UPLOAD_CLEANUP_DAYS = 7;
+  /**
+   * Chunk size for server-side streaming ingestion. Above S3's 5MB part
+   * minimum, and small enough that several concurrent imports don't add up to
+   * meaningful memory.
+   */
+  static readonly INGEST_PART_SIZE = 8 * 1024 * 1024;
 
   private readonly logger = new Logger(StorageService.name);
   private readonly s3: S3Client;
@@ -203,85 +186,212 @@ export class StorageService implements OnModuleInit {
     }
   }
 
-  /**
-   * Lists everything under the user's folder. Keys are returned relative to
-   * `users/{userId}/`, and the folder marker itself is omitted. The frontend
-   * turns this flat list into a folder tree.
-   */
-  async listUserObjects(userId: string): Promise<StorageObject[]> {
-    this.assertConfigured();
-    const prefix = `users/${userId}/`;
+  // --- Blob operations ------------------------------------------------------
+  // The database owns where a file appears in the drive; S3 only holds bytes
+  // under an opaque key. Everything below takes that key (relative to the
+  // user's prefix) rather than a user-visible path.
 
-    try {
-      const objects: StorageObject[] = [];
-      for (const obj of await this.listAllObjects(prefix)) {
-        if (!obj.Key) continue;
-        const relative = obj.Key.slice(prefix.length);
-        if (relative === '') continue; // the folder marker itself
-        if (relative.startsWith(TRASH_PREFIX)) continue; // hide the trash
-        objects.push({
-          key: relative,
-          size: obj.Size ?? 0,
-          lastModified: obj.LastModified?.getTime() ?? 0,
-        });
-      }
-      return objects;
-    } catch (error) {
-      this.logger.error(
-        `Failed to list S3 objects for users/${userId}/`,
-        error instanceof Error ? error.stack : String(error),
-      );
-      throw error;
-    }
-  }
-
-  /**
-   * Returns a short-lived presigned URL for a file. By default it forces a
-   * download (attachment); with `inline` it lets the browser render the file
-   * in place (using its stored Content-Type) for previewing images/PDFs/etc.
-   */
-  async getDownloadUrl(
-    userId: string,
-    key: string,
-    inline = false,
-  ): Promise<string> {
+  /** Presigned PUT so the browser can upload straight into `blobKey`. */
+  async getBlobUploadUrl(userId: string, blobKey: string): Promise<string> {
     this.assertConfigured();
-    const normalized = this.normalizePath(key);
-    if (!normalized || normalized.endsWith('/')) {
-      throw new Error('A file key is required');
-    }
-    const fullKey = `users/${userId}/${normalized}`;
-    const filename = normalized.split('/').pop() ?? 'download';
-    // RFC 5987 encoding so non-ASCII (e.g. Korean) filenames survive.
-    const disposition = inline
-      ? `inline; filename*=UTF-8''${encodeURIComponent(filename)}`
-      : `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`;
-    const command = new GetObjectCommand({
+    const command = new PutObjectCommand({
       Bucket: this.bucket,
-      Key: fullKey,
-      ResponseContentDisposition: disposition,
+      Key: this.fullKey(userId, blobKey),
     });
     return getSignedUrl(this.s3, command, { expiresIn: 300 });
   }
 
   /**
-   * Returns a presigned PUT URL so the browser can upload a file straight to
-   * S3, plus the relative key it will land at. Content-Type is intentionally
-   * left unsigned so the browser can set it on the PUT (and S3 stores it).
+   * Presigned GET for `blobKey`, saved (or shown inline) as `filename`. The
+   * name comes from the database rather than the key, which is why an opaque
+   * key doesn't cost the user a meaningful download name.
    */
-  async getUploadUrl(
+  async getBlobDownloadUrl(
     userId: string,
-    path: string,
-    name: string,
-  ): Promise<{ url: string; key: string }> {
+    blobKey: string,
+    filename: string,
+    inline = false,
+  ): Promise<string> {
     this.assertConfigured();
-    const relativeKey = `${this.normalizePath(path)}${this.safeName(name)}`;
-    const command = new PutObjectCommand({
+    // RFC 5987 encoding so non-ASCII (e.g. Korean) filenames survive.
+    const disposition = `${inline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(filename)}`;
+    const command = new GetObjectCommand({
       Bucket: this.bucket,
-      Key: `users/${userId}/${relativeKey}`,
+      Key: this.fullKey(userId, blobKey),
+      ResponseContentDisposition: disposition,
     });
-    const url = await getSignedUrl(this.s3, command, { expiresIn: 300 });
-    return { url, key: relativeKey };
+    return getSignedUrl(this.s3, command, { expiresIn: 300 });
+  }
+
+  /** Writes bytes to `blobKey` from the server (small, non-presigned uploads). */
+  async putBlob(
+    userId: string,
+    blobKey: string,
+    body: Buffer,
+    contentType?: string,
+  ): Promise<void> {
+    this.assertConfigured();
+    await this.s3.send(
+      new PutObjectCommand({
+        Bucket: this.bucket,
+        Key: this.fullKey(userId, blobKey),
+        Body: body,
+        ContentType: this.safeContentType(contentType),
+      }),
+    );
+  }
+
+  /**
+   * Streams bytes into `blobKey` without buffering the whole object.
+   *
+   * Used for server-side ingestion (importing from another storage provider),
+   * where the size often isn't known up front. Small objects go in one PUT;
+   * anything past the first part switches to multipart, so memory stays at one
+   * part regardless of how large the file turns out to be.
+   */
+  async putBlobStream(
+    userId: string,
+    blobKey: string,
+    body: AsyncIterable<Uint8Array>,
+    contentType?: string,
+  ): Promise<number> {
+    this.assertConfigured();
+    const key = this.fullKey(userId, blobKey);
+    const partSize = StorageService.INGEST_PART_SIZE;
+
+    let buffered: Buffer[] = [];
+    let bufferedBytes = 0;
+    let total = 0;
+    let uploadId: string | undefined;
+    const parts: MultipartPart[] = [];
+
+    const flushPart = async (): Promise<void> => {
+      const chunk = Buffer.concat(buffered, bufferedBytes);
+      buffered = [];
+      bufferedBytes = 0;
+      uploadId ??= await this.createMultipartUpload(
+        userId,
+        blobKey,
+        contentType,
+      );
+      const partNumber = parts.length + 1;
+      const res = await this.s3.send(
+        new UploadPartCommand({
+          Bucket: this.bucket,
+          Key: key,
+          UploadId: uploadId,
+          PartNumber: partNumber,
+          Body: chunk,
+        }),
+      );
+      if (!res.ETag) throw new Error('Missing ETag on uploaded part');
+      parts.push({ partNumber, etag: res.ETag });
+    };
+
+    try {
+      for await (const chunk of body) {
+        const buf = Buffer.from(chunk);
+        buffered.push(buf);
+        bufferedBytes += buf.length;
+        total += buf.length;
+        if (bufferedBytes >= partSize) await flushPart();
+      }
+
+      if (uploadId === undefined) {
+        // Never grew past one part: a plain PUT is cheaper than multipart.
+        await this.putBlob(
+          userId,
+          blobKey,
+          Buffer.concat(buffered, bufferedBytes),
+          contentType,
+        );
+        return total;
+      }
+
+      if (bufferedBytes > 0) await flushPart();
+      await this.completeMultipartUpload(userId, blobKey, uploadId, parts);
+      return total;
+    } catch (error) {
+      if (uploadId !== undefined) {
+        await this.abortMultipartUpload(userId, blobKey, uploadId).catch(
+          () => undefined,
+        );
+      }
+      throw error;
+    }
+  }
+
+  /** What S3 actually stored, used to confirm an upload really landed. */
+  async headBlob(
+    userId: string,
+    blobKey: string,
+  ): Promise<{
+    size: number;
+    contentType: string | null;
+    etag: string | null;
+    lastModified: Date;
+  }> {
+    this.assertConfigured();
+    const res = await this.s3.send(
+      new HeadObjectCommand({
+        Bucket: this.bucket,
+        Key: this.fullKey(userId, blobKey),
+      }),
+    );
+    return {
+      size: res.ContentLength ?? 0,
+      contentType: res.ContentType ?? null,
+      etag: res.ETag ?? null,
+      lastModified: res.LastModified ?? new Date(),
+    };
+  }
+
+  /** Permanently removes blobs. Missing keys are not an error. */
+  async deleteBlobs(userId: string, blobKeys: string[]): Promise<void> {
+    this.assertConfigured();
+    if (blobKeys.length === 0) return;
+    await this.deleteKeys(blobKeys.map((key) => this.fullKey(userId, key)));
+  }
+
+  /**
+   * Every object under the user's prefix, trash included, so the index can be
+   * built from a bucket that predates it. Hides nothing — the caller decides
+   * what each key means.
+   */
+  async listAllUserKeys(userId: string): Promise<
+    {
+      key: string;
+      size: number;
+      lastModified: Date;
+      etag: string | null;
+    }[]
+  > {
+    this.assertConfigured();
+    const prefix = `users/${userId}/`;
+    const objects: {
+      key: string;
+      size: number;
+      lastModified: Date;
+      etag: string | null;
+    }[] = [];
+    for (const object of await this.listAllObjects(prefix)) {
+      if (!object.Key) continue;
+      const key = object.Key.slice(prefix.length);
+      if (key === '') continue; // the user's own folder marker
+      objects.push({
+        key,
+        size: object.Size ?? 0,
+        lastModified: object.LastModified ?? new Date(),
+        // Comes free with the listing, and is what tells us later whether an
+        // object's bytes have been replaced since we last looked at them.
+        etag: object.ETag ?? null,
+      });
+    }
+    return objects;
+  }
+
+  private fullKey(userId: string, relativeKey: string): string {
+    return `users/${userId}/${this.normalizePath(relativeKey)}`;
   }
 
   // --- Multipart upload (large files, uploaded in chunks) --------------------
@@ -297,21 +407,19 @@ export class StorageService implements OnModuleInit {
    */
   async createMultipartUpload(
     userId: string,
-    path: string,
-    name: string,
+    blobKey: string,
     contentType?: string,
-  ): Promise<{ uploadId: string; key: string }> {
+  ): Promise<string> {
     this.assertConfigured();
-    const relativeKey = `${this.normalizePath(path)}${this.safeName(name)}`;
     const res = await this.s3.send(
       new CreateMultipartUploadCommand({
         Bucket: this.bucket,
-        Key: `users/${userId}/${relativeKey}`,
+        Key: this.fullKey(userId, blobKey),
         ContentType: this.safeContentType(contentType),
       }),
     );
     if (!res.UploadId) throw new Error('Failed to start multipart upload');
-    return { uploadId: res.UploadId, key: relativeKey };
+    return res.UploadId;
   }
 
   /**
@@ -342,7 +450,7 @@ export class StorageService implements OnModuleInit {
     ) {
       throw new Error('Invalid part range');
     }
-    const fullKey = `users/${userId}/${this.normalizePath(key)}`;
+    const fullKey = this.fullKey(userId, key);
     const last = firstPartNumber + partCount - 1;
     const urls: string[] = [];
     for (
@@ -373,7 +481,7 @@ export class StorageService implements OnModuleInit {
     parts: MultipartPart[],
   ): Promise<void> {
     this.assertConfigured();
-    const fullKey = `users/${userId}/${this.normalizePath(key)}`;
+    const fullKey = this.fullKey(userId, key);
     await this.s3.send(
       new CompleteMultipartUploadCommand({
         Bucket: this.bucket,
@@ -399,7 +507,7 @@ export class StorageService implements OnModuleInit {
     uploadId: string,
   ): Promise<void> {
     this.assertConfigured();
-    const fullKey = `users/${userId}/${this.normalizePath(key)}`;
+    const fullKey = this.fullKey(userId, key);
     await this.s3.send(
       new AbortMultipartUploadCommand({
         Bucket: this.bucket,
@@ -407,201 +515,6 @@ export class StorageService implements OnModuleInit {
         UploadId: uploadId,
       }),
     );
-  }
-
-  /** Uploads a file to `users/{userId}/{path}{name}`. */
-  async uploadUserFile(
-    userId: string,
-    path: string,
-    name: string,
-    body: Buffer,
-    contentType?: string,
-  ): Promise<void> {
-    this.assertConfigured();
-    const key = `users/${userId}/${this.normalizePath(path)}${this.safeName(name)}`;
-    await this.s3.send(
-      new PutObjectCommand({
-        Bucket: this.bucket,
-        Key: key,
-        Body: body,
-        ContentType: contentType,
-      }),
-    );
-    this.logger.log(`Uploaded ${key} (${body.length} bytes)`);
-  }
-
-  /** Creates an empty subfolder marker at `users/{userId}/{path}{name}/`. */
-  async createUserSubfolder(
-    userId: string,
-    path: string,
-    name: string,
-  ): Promise<void> {
-    this.assertConfigured();
-    const normalizedPath = this.normalizePath(path);
-    const safe = this.safeName(name);
-    if (!normalizedPath && `${safe}/` === TRASH_PREFIX) {
-      throw new Error(`"${safe}" is a reserved folder name`);
-    }
-    const key = `users/${userId}/${normalizedPath}${safe}/`;
-    await this.s3.send(
-      new PutObjectCommand({ Bucket: this.bucket, Key: key, Body: '' }),
-    );
-    this.logger.log(`Created folder ${key}`);
-  }
-
-  /**
-   * Moves the given paths into the trash. Each path becomes one trash "entry"
-   * keyed by its original location, so it can be restored exactly and folders
-   * vs. individual files stay distinguishable.
-   */
-  async moveToTrash(userId: string, paths: string[]): Promise<void> {
-    this.assertConfigured();
-    const base = `users/${userId}/`;
-
-    for (const rawPath of paths) {
-      const path = this.normalizePath(rawPath);
-      if (!path || path.startsWith(TRASH_PREFIX)) continue;
-
-      const { parent } = this.splitPath(path);
-      // Append a random suffix so trashing two items with the same original
-      // path produces two independent entries instead of overwriting.
-      const entryId = `${this.encodeEntryId(path)}.${randomUUID()}`;
-      const parentBase = base + parent;
-      const srcKeys = await this.listAllKeys(base + path);
-
-      for (const srcKey of srcKeys) {
-        const rel = srcKey.slice(parentBase.length);
-        const destKey = `${base}${TRASH_PREFIX}${entryId}/${rel}`;
-        await this.copyObject(srcKey, destKey);
-      }
-      await this.deleteKeys(srcKeys);
-    }
-  }
-
-  /** Restores trash entries back to their original locations. */
-  async restoreFromTrash(userId: string, entryIds: string[]): Promise<void> {
-    this.assertConfigured();
-    const base = `users/${userId}/`;
-
-    for (const entryId of entryIds) {
-      const originalPath = this.decodeEntryId(entryId);
-      const { parent } = this.splitPath(originalPath);
-      const entryPrefix = `${base}${TRASH_PREFIX}${entryId}/`;
-      const srcKeys = await this.listAllKeys(entryPrefix);
-
-      for (const srcKey of srcKeys) {
-        const rel = srcKey.slice(entryPrefix.length);
-        const destKey = `${base}${parent}${rel}`;
-        await this.copyObject(srcKey, destKey);
-      }
-      await this.deleteKeys(srcKeys);
-    }
-  }
-
-  /** Lists the top-level trash entries (the units the user actually trashed). */
-  async listUserTrash(userId: string): Promise<TrashEntry[]> {
-    this.assertConfigured();
-    const trashBase = `users/${userId}/${TRASH_PREFIX}`;
-    // Group every trashed object under its entry id to aggregate size/mtime.
-    const agg = new Map<string, { size: number; lastModified: number }>();
-    for (const obj of await this.listAllObjects(trashBase)) {
-      if (!obj.Key) continue;
-      const rel = obj.Key.slice(trashBase.length);
-      const slash = rel.indexOf('/');
-      const entryId = slash === -1 ? rel : rel.slice(0, slash);
-      if (!entryId) continue;
-      const cur = agg.get(entryId) ?? { size: 0, lastModified: 0 };
-      cur.size += obj.Size ?? 0;
-      cur.lastModified = Math.max(
-        cur.lastModified,
-        obj.LastModified?.getTime() ?? 0,
-      );
-      agg.set(entryId, cur);
-    }
-
-    const entries: TrashEntry[] = [];
-    for (const [entryId, meta] of agg) {
-      const originalPath = this.decodeEntryId(entryId);
-      const { name, isFolder } = this.splitPath(originalPath);
-      entries.push({
-        entryId,
-        originalPath,
-        name,
-        type: isFolder ? 'folder' : 'file',
-        size: meta.size,
-        lastModified: meta.lastModified,
-      });
-    }
-    return entries;
-  }
-
-  /** Permanently removes the given trash entries. */
-  async deleteTrashEntries(userId: string, entryIds: string[]): Promise<void> {
-    this.assertConfigured();
-    const base = `users/${userId}/`;
-    for (const entryId of entryIds) {
-      const keys = await this.listAllKeys(`${base}${TRASH_PREFIX}${entryId}/`);
-      await this.deleteKeys(keys);
-    }
-  }
-
-  /** Permanently removes everything in the trash. */
-  async emptyTrash(userId: string): Promise<void> {
-    this.assertConfigured();
-    const keys = await this.listAllKeys(`users/${userId}/${TRASH_PREFIX}`);
-    await this.deleteKeys(keys);
-  }
-
-  /**
-   * Permanently removes trash entries older than `olderThanMs`. A trashed
-   * object's LastModified is set to the moment it was moved into the trash
-   * (S3 CopyObject stamps the copy time), so that doubles as the "trashed at"
-   * time. Returns how many entries were purged.
-   */
-  async purgeExpiredTrash(
-    userId: string,
-    olderThanMs: number,
-  ): Promise<number> {
-    this.assertConfigured();
-    const cutoff = Date.now() - olderThanMs;
-    const expired = (await this.listUserTrash(userId))
-      .filter((entry) => entry.lastModified > 0 && entry.lastModified < cutoff)
-      .map((entry) => entry.entryId);
-
-    if (expired.length > 0) {
-      await this.deleteTrashEntries(userId, expired);
-      this.logger.log(
-        `Purged ${expired.length} expired trash entr${expired.length === 1 ? 'y' : 'ies'} for users/${userId}/`,
-      );
-    }
-    return expired.length;
-  }
-
-  private encodeEntryId(path: string): string {
-    return Buffer.from(path, 'utf8').toString('base64url');
-  }
-
-  private decodeEntryId(entryId: string): string {
-    // entryId is `<base64url(path)>.<uuid>`; the path never contains a dot.
-    const dot = entryId.indexOf('.');
-    const encoded = dot === -1 ? entryId : entryId.slice(0, dot);
-    return Buffer.from(encoded, 'base64url').toString('utf8');
-  }
-
-  /** Splits a relative path into { parent prefix, basename, isFolder }. */
-  private splitPath(path: string): {
-    parent: string;
-    name: string;
-    isFolder: boolean;
-  } {
-    const isFolder = path.endsWith('/');
-    const trimmed = isFolder ? path.slice(0, -1) : path;
-    const idx = trimmed.lastIndexOf('/');
-    return {
-      parent: idx === -1 ? '' : trimmed.slice(0, idx + 1),
-      name: idx === -1 ? trimmed : trimmed.slice(idx + 1),
-      isFolder,
-    };
   }
 
   /** Pages through ListObjectsV2 and returns every object under `prefix`. */
@@ -622,26 +535,6 @@ export class StorageService implements OnModuleInit {
         : undefined;
     } while (continuationToken);
     return objects;
-  }
-
-  private async listAllKeys(prefix: string): Promise<string[]> {
-    return (await this.listAllObjects(prefix)).flatMap((obj) =>
-      obj.Key ? [obj.Key] : [],
-    );
-  }
-
-  private async copyObject(srcKey: string, destKey: string): Promise<void> {
-    const copySource = [
-      this.bucket,
-      ...srcKey.split('/').map(encodeURIComponent),
-    ].join('/');
-    await this.s3.send(
-      new CopyObjectCommand({
-        Bucket: this.bucket,
-        Key: destKey,
-        CopySource: copySource,
-      }),
-    );
   }
 
   private async deleteKeys(keys: string[]): Promise<void> {
@@ -666,15 +559,6 @@ export class StorageService implements OnModuleInit {
   /** Strips a leading slash so a relative path never escapes the user prefix. */
   private normalizePath(path: string): string {
     return path.replace(/^\/+/, '');
-  }
-
-  /** A single path segment must not contain slashes. */
-  private safeName(name: string): string {
-    const trimmed = name.trim();
-    if (!trimmed || trimmed.includes('/')) {
-      throw new Error(`Invalid name: ${name}`);
-    }
-    return trimmed;
   }
 
   /**
