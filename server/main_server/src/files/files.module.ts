@@ -8,6 +8,7 @@ import { FileIndexService } from './file-index.service';
 import { TrashService } from './trash.service';
 import { FilesController } from './files.controller';
 import { TrashCleanupService } from './trash-cleanup.service';
+import { StorageController } from '../storage/storage.controller';
 
 @Module({
   // AuthModule provides JwtAuthGuard; StorageModule provides StorageService.
@@ -17,7 +18,9 @@ import { TrashCleanupService } from './trash-cleanup.service';
     AuthModule,
     StorageModule,
   ],
-  controllers: [FilesController],
+  // StorageController lives here (not StorageModule) because it needs
+  // JwtAuthGuard from AuthModule, which itself imports StorageModule.
+  controllers: [FilesController, StorageController],
   providers: [FileIndexService, TrashService, TrashCleanupService],
   // Exported so the Google Drive module's import feature can record files in
   // the index without a circular dependency back into this module.
