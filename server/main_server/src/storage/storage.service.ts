@@ -44,6 +44,8 @@ export class StorageService {
 
   private readonly logger = new Logger(StorageService.name);
   private readonly s3: S3Client;
+  /** Signs browser-facing URLs with the public endpoint (signature is host-bound). */
+  private readonly presigner: S3Client;
   private readonly bucket: string;
 
   constructor(private readonly config: ConfigService) {
@@ -57,6 +59,16 @@ export class StorageService {
     this.s3 = new S3Client({
       region: this.config.get<string>('AWS_REGION') ?? 'us-east-1',
       ...(endpoint ? { endpoint, forcePathStyle: true } : {}),
+    });
+    // S3_PUBLIC_ENDPOINT: what the browser can reach (e.g. the NAS's Tailscale
+    // Funnel HTTPS URL); the server keeps talking to MinIO over S3_ENDPOINT.
+    const publicEndpoint =
+      this.config.get<string>('S3_PUBLIC_ENDPOINT') ?? endpoint;
+    this.presigner = new S3Client({
+      region: this.config.get<string>('AWS_REGION') ?? 'us-east-1',
+      ...(publicEndpoint
+        ? { endpoint: publicEndpoint, forcePathStyle: true }
+        : {}),
     });
   }
 
@@ -106,7 +118,7 @@ export class StorageService {
       Bucket: this.bucket,
       Key: this.fullKey(userId, blobKey),
     });
-    return getSignedUrl(this.s3, command, { expiresIn: 300 });
+    return getSignedUrl(this.presigner, command, { expiresIn: 300 });
   }
 
   /**
@@ -128,7 +140,7 @@ export class StorageService {
       Key: this.fullKey(userId, blobKey),
       ResponseContentDisposition: disposition,
     });
-    return getSignedUrl(this.s3, command, { expiresIn: 300 });
+    return getSignedUrl(this.presigner, command, { expiresIn: 300 });
   }
 
   /** Writes bytes to `blobKey` from the server (small, non-presigned uploads). */
@@ -315,7 +327,7 @@ export class StorageService {
         PartNumber: partNumber,
       });
       urls.push(
-        await getSignedUrl(this.s3, command, {
+        await getSignedUrl(this.presigner, command, {
           expiresIn: StorageService.PART_URL_TTL_SECONDS,
         }),
       );
