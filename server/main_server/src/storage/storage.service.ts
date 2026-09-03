@@ -15,6 +15,7 @@ import {
 } from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { toProxyUrl } from './proxy-url';
 import { Readable } from 'stream';
 
 export interface MultipartPart {
@@ -44,9 +45,9 @@ export class StorageService {
 
   private readonly logger = new Logger(StorageService.name);
   private readonly s3: S3Client;
-  /** Signs browser-facing URLs with the public endpoint (signature is host-bound). */
-  private readonly presigner: S3Client;
   private readonly bucket: string;
+  /** When set, browser-facing URLs route through `/storage/proxy` on this API. */
+  private readonly publicApiUrl?: string;
 
   constructor(private readonly config: ConfigService) {
     this.bucket = this.config.get<string>('AWS_S3_BUCKET') ?? '';
@@ -60,16 +61,20 @@ export class StorageService {
       region: this.config.get<string>('AWS_REGION') ?? 'us-east-1',
       ...(endpoint ? { endpoint, forcePathStyle: true } : {}),
     });
-    // S3_PUBLIC_ENDPOINT: what the browser can reach (e.g. the NAS's Tailscale
-    // Funnel HTTPS URL); the server keeps talking to MinIO over S3_ENDPOINT.
-    const publicEndpoint =
-      this.config.get<string>('S3_PUBLIC_ENDPOINT') ?? endpoint;
-    this.presigner = new S3Client({
-      region: this.config.get<string>('AWS_REGION') ?? 'us-east-1',
-      ...(publicEndpoint
-        ? { endpoint: publicEndpoint, forcePathStyle: true }
-        : {}),
-    });
+    this.publicApiUrl = this.config.get<string>('PUBLIC_API_URL');
+  }
+
+  /**
+   * Browser-facing presigned URL. With PUBLIC_API_URL set the bytes go
+   * frontend → this API → MinIO, so clients outside the tailnet work; without
+   * it the raw presigned URL is returned (direct-to-MinIO, dev only).
+   */
+  private async presignForBrowser(
+    command: Parameters<typeof getSignedUrl>[1],
+    expiresIn: number,
+  ): Promise<string> {
+    const signed = await getSignedUrl(this.s3, command, { expiresIn });
+    return this.publicApiUrl ? toProxyUrl(this.publicApiUrl, signed) : signed;
   }
 
   // ponytail: bucket CORS + incomplete-upload lifecycle setup removed — MinIO
@@ -118,7 +123,7 @@ export class StorageService {
       Bucket: this.bucket,
       Key: this.fullKey(userId, blobKey),
     });
-    return getSignedUrl(this.presigner, command, { expiresIn: 300 });
+    return this.presignForBrowser(command, 300);
   }
 
   /**
@@ -140,7 +145,7 @@ export class StorageService {
       Key: this.fullKey(userId, blobKey),
       ResponseContentDisposition: disposition,
     });
-    return getSignedUrl(this.presigner, command, { expiresIn: 300 });
+    return this.presignForBrowser(command, 300);
   }
 
   /** Writes bytes to `blobKey` from the server (small, non-presigned uploads). */
@@ -327,9 +332,10 @@ export class StorageService {
         PartNumber: partNumber,
       });
       urls.push(
-        await getSignedUrl(this.presigner, command, {
-          expiresIn: StorageService.PART_URL_TTL_SECONDS,
-        }),
+        await this.presignForBrowser(
+          command,
+          StorageService.PART_URL_TTL_SECONDS,
+        ),
       );
     }
     return urls;
