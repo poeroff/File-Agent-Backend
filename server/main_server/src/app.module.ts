@@ -5,6 +5,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { AppController } from './app.controller';
 import { AuthModule } from './auth/auth.module';
 import { FilesModule } from './files/files.module';
+import { GoogleDriveModule } from './google-drive/google-drive.module';
 
 @Module({
   imports: [
@@ -12,6 +13,7 @@ import { FilesModule } from './files/files.module';
     ScheduleModule.forRoot(),
     AuthModule,
     FilesModule,
+    GoogleDriveModule,
     TypeOrmModule.forRootAsync({
       imports: [ConfigModule],
       inject: [ConfigService],

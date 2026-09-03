@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { StorageService } from '../storage/storage.service';
-import { FileIndexService } from './file-index.service';
+import { FileIndexService } from '../files/file-index.service';
 import { GoogleDriveService, type DriveFile } from './google-drive.service';
 
 /** Outcome per item, so a partly failed import can be reported honestly. */

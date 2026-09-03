@@ -5,6 +5,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { User } from '../users/user.entity';
 import { FileIndexService } from './file-index.service';
+import { TrashService } from './trash.service';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -20,6 +21,7 @@ export class TrashCleanupService {
   constructor(
     @InjectRepository(User) private readonly users: Repository<User>,
     private readonly index: FileIndexService,
+    private readonly trash: TrashService,
     config: ConfigService,
   ) {
     const days = Number(config.get<string>('TRASH_RETENTION_DAYS') ?? 30);
@@ -40,7 +42,7 @@ export class TrashCleanupService {
     let orphanBlobs = 0;
     for (const user of users) {
       try {
-        purged += await this.index.purgeExpiredTrash(user.id, this.retentionMs);
+        purged += await this.trash.purgeExpiredTrash(user.id, this.retentionMs);
         await this.index.purgeStaleUploads(user.id, STALE_UPLOAD_MS);
         // Adopts anything that appeared in the bucket without going through the
         // app, so it stops being invisible in the drive.

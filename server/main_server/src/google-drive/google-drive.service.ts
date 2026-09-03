@@ -9,8 +9,6 @@ export interface DriveFile {
   mimeType: string;
   size: number;
   modifiedAt: Date;
-  /** Drive's MD5 of the content — absent for Google-native docs and folders. */
-  md5: string | null;
   isFolder: boolean;
 }
 
@@ -43,7 +41,7 @@ const EXPORT_FORMATS: Record<string, { mimeType: string; extension: string }> =
     },
   };
 
-const FIELDS = 'id,name,mimeType,size,modifiedTime,md5Checksum';
+const FIELDS = 'id,name,mimeType,size,modifiedTime';
 
 /**
  * Reads a user's Google Drive on their behalf.
@@ -165,7 +163,6 @@ export class GoogleDriveService {
       mimeType: raw.mimeType,
       size: Number(raw.size ?? 0),
       modifiedAt: raw.modifiedTime ? new Date(raw.modifiedTime) : new Date(),
-      md5: raw.md5Checksum ?? null,
       isFolder: raw.mimeType === FOLDER_MIME,
     };
   }

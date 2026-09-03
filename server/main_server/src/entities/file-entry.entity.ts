@@ -104,10 +104,6 @@ export class FileEntry {
   @Column({ type: 'varchar', length: 255, nullable: true })
   contentType!: string | null;
 
-  /** S3's version stamp for the current bytes; changes if the object is replaced. */
-  @Column({ type: 'varchar', length: 255, nullable: true })
-  etag!: string | null;
-
   @Column({ type: 'datetime', precision: 3 })
   modifiedAt!: Date;
 

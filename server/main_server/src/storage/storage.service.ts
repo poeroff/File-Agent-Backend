@@ -1,23 +1,21 @@
-import { Injectable, Logger, type OnModuleInit } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
   AbortMultipartUploadCommand,
   CompleteMultipartUploadCommand,
   CreateMultipartUploadCommand,
   DeleteObjectsCommand,
-  GetBucketLifecycleConfigurationCommand,
   GetObjectCommand,
   HeadObjectCommand,
   ListObjectsV2Command,
-  PutBucketCorsCommand,
-  PutBucketLifecycleConfigurationCommand,
   PutObjectCommand,
   S3Client,
   UploadPartCommand,
-  type LifecycleRule,
   type _Object,
 } from '@aws-sdk/client-s3';
+import { Upload } from '@aws-sdk/lib-storage';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { Readable } from 'stream';
 
 export interface MultipartPart {
   partNumber: number;
@@ -25,7 +23,7 @@ export interface MultipartPart {
 }
 
 @Injectable()
-export class StorageService implements OnModuleInit {
+export class StorageService {
   /** S3's hard ceiling on parts per multipart upload. */
   static readonly MAX_PARTS = 10000;
   /**
@@ -37,12 +35,6 @@ export class StorageService implements OnModuleInit {
    * treat an expired part URL as recoverable and ask for a fresh one.
    */
   static readonly PART_URL_TTL_SECONDS = 6 * 60 * 60;
-  /**
-   * Grace period before S3 discards the parts of an upload that was never
-   * completed or aborted. Long enough that a paused upload could in principle
-   * be resumed, short enough that abandoned parts don't sit there billing.
-   */
-  static readonly ABANDONED_UPLOAD_CLEANUP_DAYS = 7;
   /**
    * Chunk size for server-side streaming ingestion. Above S3's 5MB part
    * minimum, and small enough that several concurrent imports don't add up to
@@ -59,103 +51,19 @@ export class StorageService implements OnModuleInit {
     // Region comes from config; credentials are left to the default AWS
     // credential chain (env vars locally, IAM role once this runs on AWS),
     // so no secrets need to be hardcoded.
+    // S3_ENDPOINT points at an S3-compatible server (NAS MinIO); path-style
+    // is required there because MinIO has no per-bucket DNS.
+    const endpoint = this.config.get<string>('S3_ENDPOINT');
     this.s3 = new S3Client({
-      region: this.config.get<string>('AWS_REGION'),
+      region: this.config.get<string>('AWS_REGION') ?? 'us-east-1',
+      ...(endpoint ? { endpoint, forcePathStyle: true } : {}),
     });
   }
 
-  // Browsers upload straight to S3 via presigned PUT URLs, which needs the
-  // bucket to allow cross-origin PUT/GET. Set that once on startup (best
-  // effort — logs a warning if the IAM user lacks s3:PutBucketCORS).
-  async onModuleInit(): Promise<void> {
-    if (!this.bucket) return;
-    try {
-      await this.s3.send(
-        new PutBucketCorsCommand({
-          Bucket: this.bucket,
-          CORSConfiguration: {
-            CORSRules: [
-              {
-                AllowedMethods: ['PUT', 'GET', 'HEAD'],
-                AllowedOrigins: ['*'],
-                AllowedHeaders: ['*'],
-                ExposeHeaders: ['ETag'],
-                MaxAgeSeconds: 3000,
-              },
-            ],
-          },
-        }),
-      );
-      this.logger.log('Ensured S3 bucket CORS for browser uploads');
-    } catch (error) {
-      this.logger.warn(
-        `Could not set bucket CORS (browser uploads may be blocked): ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-    }
-    await this.ensureAbandonedUploadCleanup();
-  }
-
-  /**
-   * Makes S3 clean up abandoned multipart uploads.
-   *
-   * The client aborts an upload it gives up on, but it can't when the tab is
-   * closed or the machine sleeps mid-upload. Those already-uploaded parts stay
-   * billable storage that no listing shows and nothing ever deletes, so the
-   * bucket needs a lifecycle rule as the backstop. Best effort, like the CORS
-   * rule above: it just warns if the IAM user can't set lifecycle rules.
-   */
-  private async ensureAbandonedUploadCleanup(): Promise<void> {
-    const ruleId = 'abort-incomplete-multipart-uploads';
-    try {
-      // PutBucketLifecycleConfiguration replaces the whole configuration, so
-      // read what's there and keep every rule that isn't ours.
-      let existing: LifecycleRule[] = [];
-      try {
-        const current = await this.s3.send(
-          new GetBucketLifecycleConfigurationCommand({ Bucket: this.bucket }),
-        );
-        existing = (current.Rules ?? []).filter((rule) => rule.ID !== ruleId);
-      } catch (error) {
-        // A bucket with no lifecycle configuration answers with this, which
-        // just means there is nothing to preserve.
-        const code = (error as { name?: string }).name;
-        if (code !== 'NoSuchLifecycleConfiguration') throw error;
-      }
-
-      await this.s3.send(
-        new PutBucketLifecycleConfigurationCommand({
-          Bucket: this.bucket,
-          LifecycleConfiguration: {
-            Rules: [
-              ...existing,
-              {
-                ID: ruleId,
-                Status: 'Enabled',
-                Filter: { Prefix: '' },
-                AbortIncompleteMultipartUpload: {
-                  DaysAfterInitiation:
-                    StorageService.ABANDONED_UPLOAD_CLEANUP_DAYS,
-                },
-              },
-            ],
-          },
-        }),
-      );
-      this.logger.log(
-        `Ensured S3 lifecycle rule to abort incomplete uploads after ` +
-          `${StorageService.ABANDONED_UPLOAD_CLEANUP_DAYS} days`,
-      );
-    } catch (error) {
-      this.logger.warn(
-        `Could not set the incomplete-upload lifecycle rule (abandoned ` +
-          `multipart parts may accrue storage cost): ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-      );
-    }
-  }
+  // ponytail: bucket CORS + incomplete-upload lifecycle setup removed — MinIO
+  // rejects both AWS-only calls, allows all origins by default, and purges
+  // stale multipart uploads with its own scanner. Restore from git history if
+  // this ever points back at real AWS S3.
 
   /**
    * S3 has no real folders — a "folder" is just a key prefix. We drop a
@@ -245,9 +153,9 @@ export class StorageService implements OnModuleInit {
    * Streams bytes into `blobKey` without buffering the whole object.
    *
    * Used for server-side ingestion (importing from another storage provider),
-   * where the size often isn't known up front. Small objects go in one PUT;
-   * anything past the first part switches to multipart, so memory stays at one
-   * part regardless of how large the file turns out to be.
+   * where the size often isn't known up front. lib-storage's Upload handles
+   * the single-PUT-vs-multipart switch and aborts the upload on failure;
+   * queueSize 1 keeps memory at one part regardless of file size.
    */
   async putBlobStream(
     userId: string,
@@ -256,69 +164,26 @@ export class StorageService implements OnModuleInit {
     contentType?: string,
   ): Promise<number> {
     this.assertConfigured();
-    const key = this.fullKey(userId, blobKey);
-    const partSize = StorageService.INGEST_PART_SIZE;
-
-    let buffered: Buffer[] = [];
-    let bufferedBytes = 0;
     let total = 0;
-    let uploadId: string | undefined;
-    const parts: MultipartPart[] = [];
-
-    const flushPart = async (): Promise<void> => {
-      const chunk = Buffer.concat(buffered, bufferedBytes);
-      buffered = [];
-      bufferedBytes = 0;
-      uploadId ??= await this.createMultipartUpload(
-        userId,
-        blobKey,
-        contentType,
-      );
-      const partNumber = parts.length + 1;
-      const res = await this.s3.send(
-        new UploadPartCommand({
-          Bucket: this.bucket,
-          Key: key,
-          UploadId: uploadId,
-          PartNumber: partNumber,
-          Body: chunk,
-        }),
-      );
-      if (!res.ETag) throw new Error('Missing ETag on uploaded part');
-      parts.push({ partNumber, etag: res.ETag });
-    };
-
-    try {
+    const counted = async function* (): AsyncIterable<Uint8Array> {
       for await (const chunk of body) {
-        const buf = Buffer.from(chunk);
-        buffered.push(buf);
-        bufferedBytes += buf.length;
-        total += buf.length;
-        if (bufferedBytes >= partSize) await flushPart();
+        total += chunk.length;
+        yield chunk;
       }
-
-      if (uploadId === undefined) {
-        // Never grew past one part: a plain PUT is cheaper than multipart.
-        await this.putBlob(
-          userId,
-          blobKey,
-          Buffer.concat(buffered, bufferedBytes),
-          contentType,
-        );
-        return total;
-      }
-
-      if (bufferedBytes > 0) await flushPart();
-      await this.completeMultipartUpload(userId, blobKey, uploadId, parts);
-      return total;
-    } catch (error) {
-      if (uploadId !== undefined) {
-        await this.abortMultipartUpload(userId, blobKey, uploadId).catch(
-          () => undefined,
-        );
-      }
-      throw error;
-    }
+    };
+    const upload = new Upload({
+      client: this.s3,
+      params: {
+        Bucket: this.bucket,
+        Key: this.fullKey(userId, blobKey),
+        Body: Readable.from(counted()),
+        ContentType: this.safeContentType(contentType),
+      },
+      partSize: StorageService.INGEST_PART_SIZE,
+      queueSize: 1,
+    });
+    await upload.done();
+    return total;
   }
 
   /** What S3 actually stored, used to confirm an upload really landed. */
@@ -328,7 +193,6 @@ export class StorageService implements OnModuleInit {
   ): Promise<{
     size: number;
     contentType: string | null;
-    etag: string | null;
     lastModified: Date;
   }> {
     this.assertConfigured();
@@ -341,7 +205,6 @@ export class StorageService implements OnModuleInit {
     return {
       size: res.ContentLength ?? 0,
       contentType: res.ContentType ?? null,
-      etag: res.ETag ?? null,
       lastModified: res.LastModified ?? new Date(),
     };
   }
@@ -358,22 +221,12 @@ export class StorageService implements OnModuleInit {
    * built from a bucket that predates it. Hides nothing — the caller decides
    * what each key means.
    */
-  async listAllUserKeys(userId: string): Promise<
-    {
-      key: string;
-      size: number;
-      lastModified: Date;
-      etag: string | null;
-    }[]
-  > {
+  async listAllUserKeys(
+    userId: string,
+  ): Promise<{ key: string; size: number; lastModified: Date }[]> {
     this.assertConfigured();
     const prefix = `users/${userId}/`;
-    const objects: {
-      key: string;
-      size: number;
-      lastModified: Date;
-      etag: string | null;
-    }[] = [];
+    const objects: { key: string; size: number; lastModified: Date }[] = [];
     for (const object of await this.listAllObjects(prefix)) {
       if (!object.Key) continue;
       const key = object.Key.slice(prefix.length);
@@ -382,9 +235,6 @@ export class StorageService implements OnModuleInit {
         key,
         size: object.Size ?? 0,
         lastModified: object.LastModified ?? new Date(),
-        // Comes free with the listing, and is what tells us later whether an
-        // object's bytes have been replaced since we last looked at them.
-        etag: object.ETag ?? null,
       });
     }
     return objects;

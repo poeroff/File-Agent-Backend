@@ -14,8 +14,8 @@ import { FileInterceptor } from '@nestjs/platform-express';
 import { StorageService } from '../storage/storage.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import type { AuthenticatedRequest } from '../auth/guards/jwt-auth.guard';
-import { DriveImportService } from './drive-import.service';
 import { FileIndexService } from './file-index.service';
+import { TrashService } from './trash.service';
 
 /**
  * The drive's HTTP surface.
@@ -32,7 +32,7 @@ export class FilesController {
   constructor(
     private readonly storage: StorageService,
     private readonly index: FileIndexService,
-    private readonly imports: DriveImportService,
+    private readonly trash: TrashService,
   ) {}
 
   @Get()
@@ -273,44 +273,11 @@ export class FilesController {
     return { ok: true, path: reserved.path };
   }
 
-  // --- Import from another provider -----------------------------------------
-
-  /**
-   * Copies files the user picked in Google Drive into this drive.
-   *
-   * The access token comes from the browser per request and is never stored:
-   * it carries the `drive.file` scope, so it only reaches files the user chose
-   * in the picker.
-   */
-  @Post('import/gdrive')
-  async importFromGoogleDrive(
-    @Req() request: AuthenticatedRequest,
-    @Body()
-    body: { accessToken?: string; fileIds?: string[]; path?: string },
-  ) {
-    if (!body?.accessToken) {
-      throw new BadRequestException('accessToken is required');
-    }
-    if (!Array.isArray(body?.fileIds) || body.fileIds.length === 0) {
-      throw new BadRequestException('fileIds is required');
-    }
-    const results = await this.imports.importFromGoogleDrive(
-      request.user.sub,
-      body.accessToken,
-      body.fileIds,
-      body.path ?? '',
-    );
-    return {
-      imported: results.filter((result) => result.path && !result.error).length,
-      results,
-    };
-  }
-
   // --- Trash ---------------------------------------------------------------
 
   @Get('trash')
   async listTrash(@Req() request: AuthenticatedRequest) {
-    return this.index.listTrash(request.user.sub);
+    return this.trash.listTrash(request.user.sub);
   }
 
   @Post('trash')
@@ -321,7 +288,7 @@ export class FilesController {
     if (!Array.isArray(body?.paths) || body.paths.length === 0) {
       throw new BadRequestException('paths is required');
     }
-    await this.index.moveToTrash(request.user.sub, body.paths);
+    await this.trash.moveToTrash(request.user.sub, body.paths);
     return { ok: true };
   }
 
@@ -333,7 +300,7 @@ export class FilesController {
     if (!Array.isArray(body?.entryIds) || body.entryIds.length === 0) {
       throw new BadRequestException('entryIds is required');
     }
-    await this.index.restore(request.user.sub, body.entryIds);
+    await this.trash.restore(request.user.sub, body.entryIds);
     return { ok: true };
   }
 
@@ -345,13 +312,13 @@ export class FilesController {
     if (!Array.isArray(body?.entryIds) || body.entryIds.length === 0) {
       throw new BadRequestException('entryIds is required');
     }
-    await this.index.deleteTrashEntries(request.user.sub, body.entryIds);
+    await this.trash.deleteTrashEntries(request.user.sub, body.entryIds);
     return { ok: true };
   }
 
   @Post('trash/empty')
   async emptyTrash(@Req() request: AuthenticatedRequest) {
-    await this.index.emptyTrash(request.user.sub);
+    await this.trash.emptyTrash(request.user.sub);
     return { ok: true };
   }
 }

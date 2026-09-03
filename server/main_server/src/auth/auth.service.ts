@@ -67,8 +67,4 @@ export class AuthService {
 
     return { accessToken, user };
   }
-
-  async findById(id: string) {
-    return this.users.findOne({ where: { id } });
-  }
 }

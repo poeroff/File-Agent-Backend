@@ -1,14 +1,10 @@
 import { randomUUID } from 'crypto';
 import { BadRequestException, Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { IsNull, LessThan, Not, QueryFailedError, Repository } from 'typeorm';
+import { IsNull, LessThan, Repository } from 'typeorm';
 import { StorageService } from '../storage/storage.service';
-import {
-  FileEntry,
-  MAX_PATH_LENGTH,
-  hashPath,
-  type FileEntryType,
-} from './file-entry.entity';
+import { FileEntry, type FileEntryType } from '../entities/file-entry.entity';
+import { FileEntryStore } from './file-entry-store';
 
 /** One row of the drive listing, in the shape the frontend already consumes. */
 export interface DriveListing {
@@ -18,40 +14,30 @@ export interface DriveListing {
   lastModified: number;
 }
 
-/** One unit the user trashed (its descendants are hidden behind it). */
-export interface TrashListing {
-  entryId: string;
-  originalPath: string;
-  name: string;
-  type: FileEntryType;
-  size: number;
-  lastModified: number;
-}
-
 /** Blobs live under this prefix; nothing about a blob key is user-visible. */
 const BLOB_PREFIX = 'blobs/';
-
-/** The pre-index layout kept trashed objects under this prefix. */
-const LEGACY_TRASH_PREFIX = '.trash/';
 
 /**
  * Owns the drive's structure: what exists, what it's called and where it sits.
  *
  * S3 keeps only bytes, under keys nothing ever renames. Everything the user
- * experiences as file management — listing, foldering, moving, renaming,
- * trashing, restoring — happens here as row updates, which is what makes those
- * operations instant regardless of file size. (S3 can't rename at all: it
- * copies, and it refuses to copy anything over 5GB in one request.)
+ * experiences as file management — listing, foldering, moving, renaming —
+ * happens here as row updates, which is what makes those operations instant
+ * regardless of file size. (S3 can't rename at all: it copies, and it refuses
+ * to copy anything over 5GB in one request.) Trashing lives in TrashService,
+ * which shares this service's row/path plumbing through FileEntryStore.
  */
 @Injectable()
-export class FileIndexService {
+export class FileIndexService extends FileEntryStore {
   private readonly logger = new Logger(FileIndexService.name);
 
   constructor(
     @InjectRepository(FileEntry)
-    private readonly entries: Repository<FileEntry>,
-    private readonly storage: StorageService,
-  ) {}
+    entries: Repository<FileEntry>,
+    storage: StorageService,
+  ) {
+    super(entries, storage);
+  }
 
   // --- Listing --------------------------------------------------------------
 
@@ -138,7 +124,6 @@ export class FileIndexService {
     const head = await this.storage.headBlob(userId, blobKey);
     entry.size = head.size;
     entry.contentType = head.contentType ?? entry.contentType;
-    entry.etag = head.etag;
     entry.modifiedAt = head.lastModified;
     entry.status = 'ready';
     await this.entries.save(entry);
@@ -270,116 +255,7 @@ export class FileIndexService {
     }
   }
 
-  // --- Trash ---------------------------------------------------------------
-
-  /**
-   * Trashes items by clearing their path — which frees the name for reuse —
-   * and remembering where to put them back. Descendants are tagged with the
-   * same root so the trash lists one entry per thing the user deleted.
-   */
-  async moveToTrash(userId: string, paths: string[]): Promise<void> {
-    const now = new Date();
-    for (const rawPath of paths) {
-      const path = this.normalizePath(rawPath);
-      if (!path) continue;
-      const entry = await this.liveEntry(userId, path);
-      if (!entry) continue;
-      const group = [entry, ...(await this.descendantsOf(userId, path))];
-      for (const row of group) {
-        row.trashedAt = now;
-        row.trashedFromPath = row.path;
-        row.trashRootId = entry.id;
-        this.clearPath(row);
-      }
-      await this.entries.manager.transaction((manager) => manager.save(group));
-    }
-  }
-
-  async listTrash(userId: string): Promise<TrashListing[]> {
-    const trashed = await this.entries.find({
-      where: { userId, trashedAt: Not(IsNull()) },
-      order: { trashedAt: 'DESC' },
-    });
-    return trashed
-      .filter((row) => row.trashRootId === row.id)
-      .map((root) => ({
-        entryId: root.id,
-        originalPath: root.trashedFromPath ?? root.name,
-        name: root.name,
-        type: root.type,
-        size: trashed
-          .filter((row) => row.trashRootId === root.id)
-          .reduce((sum, row) => sum + row.size, 0),
-        // When it was trashed is what the trash view sorts and expires on.
-        lastModified: (root.trashedAt ?? root.modifiedAt).getTime(),
-      }));
-  }
-
-  /** Puts trashed groups back, renaming if the old name is taken again. */
-  async restore(userId: string, entryIds: string[]): Promise<void> {
-    for (const entryId of entryIds) {
-      const group = await this.trashGroup(userId, entryId);
-      const root = group.find((row) => row.id === entryId);
-      if (!root) continue;
-
-      const oldPath = root.trashedFromPath ?? root.name;
-      const oldParent = this.parentOf(oldPath);
-      // The folder it came from may itself be gone by now; fall back to root.
-      const parent = (await this.folderExists(userId, oldParent))
-        ? oldParent
-        : '';
-      const name = await this.freeName(userId, parent, root.name);
-      const rootPath = this.joinPath(parent, name);
-      this.assertPathLength(rootPath);
-
-      for (const row of group) {
-        const from = row.trashedFromPath ?? row.name;
-        const path =
-          row.id === root.id
-            ? rootPath
-            : `${rootPath}${from.slice(oldPath.length)}`;
-        this.assertPathLength(path);
-        this.setPath(row, this.parentOf(path), this.nameOf(path));
-        row.trashedAt = null;
-        row.trashedFromPath = null;
-        row.trashRootId = null;
-      }
-      await this.entries.manager.transaction((manager) => manager.save(group));
-    }
-  }
-
-  /** Deletes trashed groups for good, blobs included. */
-  async deleteTrashEntries(userId: string, entryIds: string[]): Promise<void> {
-    for (const entryId of entryIds) {
-      await this.destroy(userId, await this.trashGroup(userId, entryId));
-    }
-  }
-
-  async emptyTrash(userId: string): Promise<void> {
-    await this.destroy(
-      userId,
-      await this.entries.find({
-        where: { userId, trashedAt: Not(IsNull()) },
-      }),
-    );
-  }
-
-  /** Deletes trash older than the retention window. Returns entries removed. */
-  async purgeExpiredTrash(
-    userId: string,
-    olderThanMs: number,
-  ): Promise<number> {
-    const cutoff = Date.now() - olderThanMs;
-    const expired = (await this.listTrash(userId)).filter(
-      (entry) => entry.lastModified < cutoff,
-    );
-    if (expired.length === 0) return 0;
-    await this.deleteTrashEntries(
-      userId,
-      expired.map((entry) => entry.entryId),
-    );
-    return expired.length;
-  }
+  // --- Maintenance ----------------------------------------------------------
 
   /**
    * Cleans up uploads that were reserved but never confirmed — a tab closed
@@ -403,22 +279,6 @@ export class FileIndexService {
     if (stale.length === 0) return 0;
     await this.destroy(userId, stale);
     return stale.length;
-  }
-
-  /**
-   * Blobs go first: deleting an object that is already gone is a no-op, so if
-   * the row deletion fails the user can simply delete again. The other order
-   * would leave paid-for bytes with nothing pointing at them.
-   */
-  private async destroy(userId: string, rows: FileEntry[]): Promise<void> {
-    if (rows.length === 0) return;
-    const blobKeys = rows
-      .filter((row): row is FileEntry & { blobKey: string } =>
-        Boolean(row.type === 'file' && row.blobKey),
-      )
-      .map((row) => row.blobKey);
-    await this.storage.deleteBlobs(userId, blobKeys);
-    await this.entries.remove(rows);
   }
 
   // --- Import from S3 -------------------------------------------------------
@@ -481,12 +341,7 @@ export class FileIndexService {
    */
   private async indexObjects(
     userId: string,
-    objects: {
-      key: string;
-      size: number;
-      lastModified: Date;
-      etag?: string | null;
-    }[],
+    objects: { key: string; size: number; lastModified: Date }[],
   ): Promise<number> {
     if (objects.length === 0) return 0;
     const existing = await this.entries.find({
@@ -502,7 +357,7 @@ export class FileIndexService {
       for (const ancestor of this.ancestorsOf(path)) {
         if (taken.has(ancestor)) continue;
         taken.add(ancestor);
-        rows.push(this.buildRow(userId, ancestor, 'folder', 0, at, null, null));
+        rows.push(this.buildRow(userId, ancestor, 'folder', 0, at, null));
       }
     };
 
@@ -511,10 +366,7 @@ export class FileIndexService {
       // path to be placed at; `reconcile` reports them instead.
       if (object.key.startsWith(BLOB_PREFIX)) continue;
 
-      const legacyTrash = this.parseLegacyTrashKey(object.key);
-      const path = this.normalizePath(
-        legacyTrash ? legacyTrash.originalPath : object.key,
-      );
+      const path = this.normalizePath(object.key);
       if (!path) continue;
 
       // A key ending in "/" is an explicit (empty) folder marker.
@@ -523,50 +375,28 @@ export class FileIndexService {
         addFolders(path, object.lastModified);
         taken.add(path);
         rows.push(
-          this.buildRow(
-            userId,
-            path,
-            'folder',
-            0,
-            object.lastModified,
-            null,
-            null,
-          ),
+          this.buildRow(userId, path, 'folder', 0, object.lastModified, null),
         );
         continue;
       }
 
-      // A trashed row holds no path, so it can never collide.
-      const finalPath = legacyTrash ? path : this.freePathIn(taken, path);
-      if (!legacyTrash) {
-        addFolders(finalPath, object.lastModified);
-        taken.add(finalPath);
-      }
-      const row = this.buildRow(
-        userId,
-        finalPath,
-        'file',
-        object.size,
-        object.lastModified,
-        object.key,
-        object.etag ?? null,
+      const finalPath = this.freePathIn(taken, path);
+      addFolders(finalPath, object.lastModified);
+      taken.add(finalPath);
+      rows.push(
+        this.buildRow(
+          userId,
+          finalPath,
+          'file',
+          object.size,
+          object.lastModified,
+          object.key,
+        ),
       );
-      if (legacyTrash) {
-        row.trashedAt = object.lastModified;
-        row.trashedFromPath = path;
-        this.clearPath(row);
-      }
-      rows.push(row);
     }
 
     if (rows.length === 0) return 0;
-    const saved = await this.entries.save(rows);
-    // Each imported trashed object stands alone: the old layout had no notion
-    // of a trashed subtree, so every row is its own group root.
-    const trashedRows = saved.filter((row) => row.trashedAt !== null);
-    for (const row of trashedRows) row.trashRootId = row.id;
-    if (trashedRows.length > 0) await this.entries.save(trashedRows);
-    return saved.length;
+    return (await this.entries.save(rows)).length;
   }
 
   private buildRow(
@@ -576,7 +406,6 @@ export class FileIndexService {
     size: number,
     modifiedAt: Date,
     blobKey: string | null,
-    etag: string | null,
   ): FileEntry {
     const row = this.entries.create({
       userId,
@@ -584,9 +413,6 @@ export class FileIndexService {
       blobKey,
       size: type === 'file' ? size : 0,
       modifiedAt,
-      // The listing already carries S3's version stamp, so recording it costs
-      // nothing and gives change detection something to compare against later.
-      etag,
       status: 'ready',
     });
     this.setPath(row, this.parentOf(path), this.nameOf(path));
@@ -601,24 +427,6 @@ export class FileIndexService {
       this.nameOf(path),
     );
     return this.joinPath(parent, name);
-  }
-
-  /** Recognises the old `.trash/{base64url(path)}.{uuid}/…` layout. */
-  private parseLegacyTrashKey(key: string): { originalPath: string } | null {
-    if (!key.startsWith(LEGACY_TRASH_PREFIX)) return null;
-    const rest = key.slice(LEGACY_TRASH_PREFIX.length);
-    const slash = rest.indexOf('/');
-    const entryId = slash === -1 ? rest : rest.slice(0, slash);
-    const dot = entryId.indexOf('.');
-    if (dot <= 0) return null;
-    const decoded = Buffer.from(entryId.slice(0, dot), 'base64url').toString(
-      'utf8',
-    );
-    if (!decoded) return null;
-    const relative = slash === -1 ? '' : rest.slice(slash + 1);
-    if (!relative) return { originalPath: decoded };
-    // Objects under an entry were stored relative to the trashed item's parent.
-    return { originalPath: this.joinPath(this.parentOf(decoded), relative) };
   }
 
   // --- Row helpers ----------------------------------------------------------
@@ -654,50 +462,6 @@ export class FileIndexService {
         if (!this.isDuplicateKey(error) || attempt >= 5) throw error;
       }
     }
-  }
-
-  private setPath(row: FileEntry, parentPath: string, name: string): void {
-    const path = this.joinPath(parentPath, name);
-    row.name = name;
-    row.path = path;
-    row.pathHash = hashPath(path);
-    row.parentPath = parentPath;
-    row.parentPathHash = hashPath(parentPath);
-  }
-
-  /** Detaches a row from the tree (what being in the trash means). */
-  private clearPath(row: FileEntry): void {
-    row.path = null;
-    row.pathHash = null;
-    row.parentPath = null;
-    row.parentPathHash = null;
-  }
-
-  private liveEntry(userId: string, path: string): Promise<FileEntry | null> {
-    return this.entries.findOne({
-      where: { userId, pathHash: hashPath(path), trashedAt: IsNull() },
-    });
-  }
-
-  /** Everything under `path`, excluding `path` itself. */
-  private descendantsOf(userId: string, path: string): Promise<FileEntry[]> {
-    return this.entries
-      .createQueryBuilder('entry')
-      .where('entry.userId = :userId', { userId })
-      .andWhere('entry.trashedAt IS NULL')
-      .andWhere('entry.path LIKE :prefix', {
-        prefix: `${this.escapeLike(path)}/%`,
-      })
-      .getMany();
-  }
-
-  private trashGroup(userId: string, entryId: string): Promise<FileEntry[]> {
-    return this.entries.find({ where: { userId, trashRootId: entryId } });
-  }
-
-  private async folderExists(userId: string, path: string): Promise<boolean> {
-    if (path === '') return true; // the drive root always exists
-    return (await this.liveEntry(userId, path))?.type === 'folder';
   }
 
   private async assertFolderExists(
@@ -743,85 +507,6 @@ export class FileIndexService {
     }
   }
 
-  /**
-   * `name` if free in `parentPath`, otherwise "name (1)", "name (2)", … so an
-   * upload never silently replaces a different file that happens to share a
-   * name. Files keep their extension: "report (1).pdf".
-   */
-  private async freeName(
-    userId: string,
-    parentPath: string,
-    name: string,
-  ): Promise<string> {
-    const siblings = await this.entries.find({
-      where: {
-        userId,
-        parentPathHash: hashPath(parentPath),
-        trashedAt: IsNull(),
-      },
-      select: { name: true },
-    });
-    return this.nextFreeName(new Set(siblings.map((row) => row.name)), name);
-  }
-
-  /** `name` if free in `taken`, else "name (1)", "name (2)", … keeping the extension. */
-  private nextFreeName(
-    taken: { has(name: string): boolean },
-    name: string,
-  ): string {
-    if (!taken.has(name)) return name;
-    const dot = name.lastIndexOf('.');
-    const base = dot > 0 ? name.slice(0, dot) : name;
-    const ext = dot > 0 ? name.slice(dot) : '';
-    for (let i = 1; ; i += 1) {
-      const candidate = `${base} (${i})${ext}`;
-      if (!taken.has(candidate)) return candidate;
-    }
-  }
-
-  private isDuplicateKey(error: unknown): boolean {
-    if (!(error instanceof QueryFailedError)) return false;
-    const code = (error as QueryFailedError & { code?: string }).code;
-    return code === 'ER_DUP_ENTRY';
-  }
-
-  // --- Path helpers ---------------------------------------------------------
-
-  /** Drops empty and relative segments so a path can't escape the drive. */
-  private normalizePath(path: string): string {
-    return path
-      .split('/')
-      .filter(
-        (segment) => segment !== '' && segment !== '.' && segment !== '..',
-      )
-      .join('/');
-  }
-
-  private joinPath(parentPath: string, name: string): string {
-    return parentPath ? `${parentPath}/${name}` : name;
-  }
-
-  private parentOf(path: string): string {
-    const slash = path.lastIndexOf('/');
-    return slash === -1 ? '' : path.slice(0, slash);
-  }
-
-  private nameOf(path: string): string {
-    const slash = path.lastIndexOf('/');
-    return slash === -1 ? path : path.slice(slash + 1);
-  }
-
-  /** Every folder path leading to `path`, outermost first. */
-  private ancestorsOf(path: string): string[] {
-    const parts = this.parentOf(path).split('/').filter(Boolean);
-    return parts.map((_, index) => parts.slice(0, index + 1).join('/'));
-  }
-
-  /** A path is data, not a pattern: "100%_done" must not match wildcards. */
-  private escapeLike(value: string): string {
-    return value.replace(/[\\%_]/g, (match) => `\\${match}`);
-  }
-
   private safeName(name: string): string {
     const trimmed = name.trim();
     if (!trimmed || trimmed.includes('/')) {
@@ -830,9 +515,9 @@ export class FileIndexService {
     return trimmed;
   }
 
-  private assertPathLength(path: string): void {
-    if (Buffer.byteLength(path, 'utf8') > MAX_PATH_LENGTH) {
-      throw new BadRequestException('Path is too long');
-    }
+  /** Every folder path leading to `path`, outermost first. */
+  private ancestorsOf(path: string): string[] {
+    const parts = this.parentOf(path).split('/').filter(Boolean);
+    return parts.map((_, index) => parts.slice(0, index + 1).join('/'));
   }
 }
