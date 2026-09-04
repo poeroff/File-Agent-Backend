@@ -21,6 +21,13 @@ import { FileIndexService } from './file-index.service';
 import { TrashService } from './trash.service';
 
 /**
+ * Every drive is keyed by an owner id. The shared drive is simply a fixed
+ * owner every authenticated user may act as — no user UUID can collide with
+ * it, and the index/storage layers need no concept of "shared" at all.
+ */
+const SHARED_DRIVE_ID = 'shared';
+
+/**
  * The drive's HTTP surface.
  *
  * Two collaborators, with a clean split: FileIndexService knows where files
@@ -28,6 +35,9 @@ import { TrashService } from './trash.service';
  * `key` in these endpoints is a user-visible path (what the frontend shows);
  * a `blobKey` is the opaque S3 key underneath it, only ever handed to the
  * client as an upload target.
+ *
+ * Every endpoint takes an optional `drive` ("shared" targets the shared
+ * drive; anything else means the caller's personal drive).
  */
 @UseGuards(JwtAuthGuard)
 @Controller('files')
@@ -38,9 +48,16 @@ export class FilesController {
     private readonly trash: TrashService,
   ) {}
 
+  private owner(request: AuthenticatedRequest, drive?: string): string {
+    return drive === 'shared' ? SHARED_DRIVE_ID : request.user.sub;
+  }
+
   @Get()
-  async list(@Req() request: AuthenticatedRequest) {
-    return this.index.listDrive(request.user.sub);
+  async list(
+    @Req() request: AuthenticatedRequest,
+    @Query('drive') drive?: string,
+  ) {
+    return this.index.listDrive(this.owner(request, drive));
   }
 
   @Get('download')
@@ -48,9 +65,10 @@ export class FilesController {
     @Req() request: AuthenticatedRequest,
     @Query('key') key: string,
     @Query('inline') inline?: string,
+    @Query('drive') drive?: string,
   ) {
     if (!key) throw new BadRequestException('key is required');
-    const userId = request.user.sub;
+    const userId = this.owner(request, drive);
     const file = await this.index.resolveFile(userId, key);
     const url = await this.storage.getBlobDownloadUrl(
       userId,
@@ -71,9 +89,10 @@ export class FilesController {
     @Req() request: AuthenticatedRequest,
     @Query('key') key: string,
     @Res() res: Response,
+    @Query('drive') drive?: string,
   ) {
     if (!key) throw new BadRequestException('key is required');
-    const userId = request.user.sub;
+    const userId = this.owner(request, drive);
     const { name, files } = await this.index.resolveFolderFiles(userId, key);
 
     res.setHeader('Content-Type', 'application/zip');
@@ -102,11 +121,11 @@ export class FilesController {
   @Post('folder')
   async createFolder(
     @Req() request: AuthenticatedRequest,
-    @Body() body: { path?: string; name?: string },
+    @Body() body: { path?: string; name?: string; drive?: string },
   ) {
     if (!body?.name) throw new BadRequestException('name is required');
     const path = await this.index.createFolder(
-      request.user.sub,
+      this.owner(request, body.drive),
       body.path ?? '',
       body.name,
     );
@@ -116,25 +135,29 @@ export class FilesController {
   @Post('move')
   async move(
     @Req() request: AuthenticatedRequest,
-    @Body() body: { paths?: string[]; destination?: string },
+    @Body() body: { paths?: string[]; destination?: string; drive?: string },
   ) {
     if (!Array.isArray(body?.paths) || body.paths.length === 0) {
       throw new BadRequestException('paths is required');
     }
-    await this.index.move(request.user.sub, body.paths, body.destination ?? '');
+    await this.index.move(
+      this.owner(request, body.drive),
+      body.paths,
+      body.destination ?? '',
+    );
     return { ok: true };
   }
 
   @Post('rename')
   async rename(
     @Req() request: AuthenticatedRequest,
-    @Body() body: { path?: string; name?: string },
+    @Body() body: { path?: string; name?: string; drive?: string },
   ) {
     if (!body?.path || !body?.name) {
       throw new BadRequestException('path and name are required');
     }
     const path = await this.index.rename(
-      request.user.sub,
+      this.owner(request, body.drive),
       body.path,
       body.name,
     );
@@ -150,10 +173,11 @@ export class FilesController {
   @Post('upload-url')
   async uploadUrl(
     @Req() request: AuthenticatedRequest,
-    @Body() body: { path?: string; name?: string; contentType?: string },
+    @Body()
+    body: { path?: string; name?: string; contentType?: string; drive?: string },
   ) {
     if (!body?.name) throw new BadRequestException('name is required');
-    const userId = request.user.sub;
+    const userId = this.owner(request, body.drive);
     const reserved = await this.index.beginUpload(
       userId,
       body.path ?? '',
@@ -171,10 +195,10 @@ export class FilesController {
   @Post('upload/complete')
   async uploadComplete(
     @Req() request: AuthenticatedRequest,
-    @Body() body: { key?: string },
+    @Body() body: { key?: string; drive?: string },
   ) {
     if (!body?.key) throw new BadRequestException('key is required');
-    await this.index.completeUpload(request.user.sub, body.key);
+    await this.index.completeUpload(this.owner(request, body.drive), body.key);
     return { ok: true };
   }
 
@@ -182,10 +206,10 @@ export class FilesController {
   @Post('upload/abort')
   async uploadAbort(
     @Req() request: AuthenticatedRequest,
-    @Body() body: { key?: string },
+    @Body() body: { key?: string; drive?: string },
   ) {
     if (!body?.key) throw new BadRequestException('key is required');
-    await this.index.cancelUpload(request.user.sub, body.key);
+    await this.index.cancelUpload(this.owner(request, body.drive), body.key);
     return { ok: true };
   }
 
@@ -194,10 +218,11 @@ export class FilesController {
   @Post('multipart/create')
   async multipartCreate(
     @Req() request: AuthenticatedRequest,
-    @Body() body: { path?: string; name?: string; contentType?: string },
+    @Body()
+    body: { path?: string; name?: string; contentType?: string; drive?: string },
   ) {
     if (!body?.name) throw new BadRequestException('name is required');
-    const userId = request.user.sub;
+    const userId = this.owner(request, body.drive);
     const reserved = await this.index.beginUpload(
       userId,
       body.path ?? '',
@@ -226,13 +251,14 @@ export class FilesController {
       uploadId?: string;
       parts?: number;
       firstPart?: number;
+      drive?: string;
     },
   ) {
     if (!body?.key || !body?.uploadId || !body?.parts) {
       throw new BadRequestException('key, uploadId and parts are required');
     }
     const urls = await this.storage.getMultipartPartUrls(
-      request.user.sub,
+      this.owner(request, body.drive),
       body.key,
       body.uploadId,
       body.parts,
@@ -249,12 +275,13 @@ export class FilesController {
       key?: string;
       uploadId?: string;
       parts?: { partNumber: number; etag: string }[];
+      drive?: string;
     },
   ) {
     if (!body?.key || !body?.uploadId || !Array.isArray(body?.parts)) {
       throw new BadRequestException('key, uploadId and parts are required');
     }
-    const userId = request.user.sub;
+    const userId = this.owner(request, body.drive);
     await this.storage.completeMultipartUpload(
       userId,
       body.key,
@@ -269,12 +296,12 @@ export class FilesController {
   @Post('multipart/abort')
   async multipartAbort(
     @Req() request: AuthenticatedRequest,
-    @Body() body: { key?: string; uploadId?: string },
+    @Body() body: { key?: string; uploadId?: string; drive?: string },
   ) {
     if (!body?.key || !body?.uploadId) {
       throw new BadRequestException('key and uploadId are required');
     }
-    const userId = request.user.sub;
+    const userId = this.owner(request, body.drive);
     await this.storage.abortMultipartUpload(userId, body.key, body.uploadId);
     await this.index.cancelUpload(userId, body.key);
     return { ok: true };
@@ -289,10 +316,10 @@ export class FilesController {
   async upload(
     @Req() request: AuthenticatedRequest,
     @UploadedFile() file: Express.Multer.File | undefined,
-    @Body() body: { path?: string; name?: string },
+    @Body() body: { path?: string; name?: string; drive?: string },
   ) {
     if (!file) throw new BadRequestException('file is required');
-    const userId = request.user.sub;
+    const userId = this.owner(request, body.drive);
     const reserved = await this.index.beginUpload(
       userId,
       body.path ?? '',
@@ -317,49 +344,58 @@ export class FilesController {
   // --- Trash ---------------------------------------------------------------
 
   @Get('trash')
-  async listTrash(@Req() request: AuthenticatedRequest) {
-    return this.trash.listTrash(request.user.sub);
+  async listTrash(
+    @Req() request: AuthenticatedRequest,
+    @Query('drive') drive?: string,
+  ) {
+    return this.trash.listTrash(this.owner(request, drive));
   }
 
   @Post('trash')
   async moveToTrash(
     @Req() request: AuthenticatedRequest,
-    @Body() body: { paths?: string[] },
+    @Body() body: { paths?: string[]; drive?: string },
   ) {
     if (!Array.isArray(body?.paths) || body.paths.length === 0) {
       throw new BadRequestException('paths is required');
     }
-    await this.trash.moveToTrash(request.user.sub, body.paths);
+    await this.trash.moveToTrash(this.owner(request, body.drive), body.paths);
     return { ok: true };
   }
 
   @Post('restore')
   async restore(
     @Req() request: AuthenticatedRequest,
-    @Body() body: { entryIds?: string[] },
+    @Body() body: { entryIds?: string[]; drive?: string },
   ) {
     if (!Array.isArray(body?.entryIds) || body.entryIds.length === 0) {
       throw new BadRequestException('entryIds is required');
     }
-    await this.trash.restore(request.user.sub, body.entryIds);
+    await this.trash.restore(this.owner(request, body.drive), body.entryIds);
     return { ok: true };
   }
 
   @Post('trash/delete')
   async deleteTrash(
     @Req() request: AuthenticatedRequest,
-    @Body() body: { entryIds?: string[] },
+    @Body() body: { entryIds?: string[]; drive?: string },
   ) {
     if (!Array.isArray(body?.entryIds) || body.entryIds.length === 0) {
       throw new BadRequestException('entryIds is required');
     }
-    await this.trash.deleteTrashEntries(request.user.sub, body.entryIds);
+    await this.trash.deleteTrashEntries(
+      this.owner(request, body.drive),
+      body.entryIds,
+    );
     return { ok: true };
   }
 
   @Post('trash/empty')
-  async emptyTrash(@Req() request: AuthenticatedRequest) {
-    await this.trash.emptyTrash(request.user.sub);
+  async emptyTrash(
+    @Req() request: AuthenticatedRequest,
+    @Body() body?: { drive?: string },
+  ) {
+    await this.trash.emptyTrash(this.owner(request, body?.drive));
     return { ok: true };
   }
 }

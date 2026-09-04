@@ -32,7 +32,12 @@ export class GoogleDriveController {
   async importFromGoogleDrive(
     @Req() request: AuthenticatedRequest,
     @Body()
-    body: { accessToken?: string; fileIds?: string[]; path?: string },
+    body: {
+      accessToken?: string;
+      fileIds?: string[];
+      path?: string;
+      drive?: string;
+    },
   ) {
     if (!body?.accessToken) {
       throw new BadRequestException('accessToken is required');
@@ -41,7 +46,8 @@ export class GoogleDriveController {
       throw new BadRequestException('fileIds is required');
     }
     const results = await this.imports.importFromGoogleDrive(
-      request.user.sub,
+      // Same convention as FilesController: "shared" targets the shared drive.
+      body.drive === 'shared' ? 'shared' : request.user.sub,
       body.accessToken,
       body.fileIds,
       body.path ?? '',
