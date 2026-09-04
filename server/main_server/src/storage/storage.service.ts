@@ -203,6 +203,18 @@ export class StorageService {
     return total;
   }
 
+  /** Opens a read stream for `blobKey` (server-side reads, e.g. zipping). */
+  async getBlobStream(userId: string, blobKey: string): Promise<Readable> {
+    this.assertConfigured();
+    const res = await this.s3.send(
+      new GetObjectCommand({
+        Bucket: this.bucket,
+        Key: this.fullKey(userId, blobKey),
+      }),
+    );
+    return res.Body as Readable;
+  }
+
   /** What S3 actually stored, used to confirm an upload really landed. */
   async headBlob(
     userId: string,

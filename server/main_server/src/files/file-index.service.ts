@@ -158,6 +158,34 @@ export class FileIndexService extends FileEntryStore {
     return { blobKey: entry.blobKey, name: entry.name };
   }
 
+  /**
+   * Resolves a folder to every ready file inside it, with paths relative to
+   * the folder itself (what a zip of that folder should contain).
+   */
+  async resolveFolderFiles(
+    userId: string,
+    path: string,
+  ): Promise<{
+    name: string;
+    files: { relativePath: string; blobKey: string }[];
+  }> {
+    const folderPath = this.normalizePath(path);
+    const folder = await this.liveEntry(userId, folderPath);
+    if (!folder || folder.type !== 'folder') {
+      throw new BadRequestException('No such folder');
+    }
+    const files = (await this.descendantsOf(userId, folderPath))
+      .filter(
+        (entry): entry is FileEntry & { blobKey: string } =>
+          entry.type === 'file' && !!entry.blobKey && entry.status === 'ready',
+      )
+      .map((entry) => ({
+        relativePath: (entry.path ?? '').slice(folderPath.length + 1),
+        blobKey: entry.blobKey,
+      }));
+    return { name: folder.name, files };
+  }
+
   // --- Moving and renaming --------------------------------------------------
 
   /**

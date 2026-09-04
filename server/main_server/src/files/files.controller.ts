@@ -6,11 +6,14 @@ import {
   Post,
   Query,
   Req,
+  Res,
   UploadedFile,
   UseGuards,
   UseInterceptors,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
+import type { Response } from 'express';
+import archiver from 'archiver';
 import { StorageService } from '../storage/storage.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import type { AuthenticatedRequest } from '../auth/guards/jwt-auth.guard';
@@ -56,6 +59,44 @@ export class FilesController {
       inline === '1' || inline === 'true',
     );
     return { url };
+  }
+
+  /**
+   * Streams a folder as a zip. Unlike single-file downloads (presigned,
+   * direct from S3) the bytes pass through this server: a zip has no object
+   * to presign, so it's assembled here entry by entry without buffering.
+   */
+  @Get('download-zip')
+  async downloadZip(
+    @Req() request: AuthenticatedRequest,
+    @Query('key') key: string,
+    @Res() res: Response,
+  ) {
+    if (!key) throw new BadRequestException('key is required');
+    const userId = request.user.sub;
+    const { name, files } = await this.index.resolveFolderFiles(userId, key);
+
+    res.setHeader('Content-Type', 'application/zip');
+    // RFC 5987 encoding so non-ASCII (e.g. Korean) folder names survive.
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename*=UTF-8''${encodeURIComponent(`${name}.zip`)}`,
+    );
+
+    // store (no deflate): drive content is mostly already-compressed media,
+    // and deflate would pin a CPU core per download for little size gain.
+    const archive = archiver('zip', { store: true });
+    archive.on('error', () => res.destroy());
+    archive.pipe(res);
+    // ponytail: every entry's S3 stream is opened up front (archiver reads
+    // them serially). Fine for ordinary folders; switch to just-in-time
+    // appends if huge folders exhaust connections or hit idle timeouts.
+    for (const file of files) {
+      archive.append(await this.storage.getBlobStream(userId, file.blobKey), {
+        name: file.relativePath,
+      });
+    }
+    await archive.finalize();
   }
 
   @Post('folder')

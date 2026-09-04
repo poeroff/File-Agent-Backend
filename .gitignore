@@ -33,8 +33,9 @@ out/
 .env.local
 .env.*.local
 
-# npm cache directory
+# npm/pnpm cache directories
 .npm
+.pnpm-store/
 *.tgz
 
 # yarn v2
